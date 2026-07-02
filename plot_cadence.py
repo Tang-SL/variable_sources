@@ -38,10 +38,14 @@ OUT_PDF = SCRIPT_DIR / "hsc_cadence.pdf"
 OUT_PNG = SCRIPT_DIR / "hsc_cadence.png"
 OUT_ZOOM_PDF = SCRIPT_DIR / "hsc_cadence_2017_detail.pdf"
 OUT_ZOOM_PNG = SCRIPT_DIR / "hsc_cadence_2017_detail.png"
+OUT_NIGHT_PDF = SCRIPT_DIR / "hsc_cadence_single_night.pdf"
+OUT_NIGHT_PNG = SCRIPT_DIR / "hsc_cadence_single_night.png"
 DETAIL_SOURCE = "cid_1205"
 DETAIL_WINDOW_DAYS = 180.0
 DETAIL_SEARCH_START = pd.Timestamp("2016-07-01")
 DETAIL_SEARCH_END = pd.Timestamp("2017-07-01")
+SINGLE_NIGHT_SOURCE = DETAIL_SOURCE
+SINGLE_NIGHT_MJD: int | None = None
 
 FILTER_STYLE = {
     "g": {"color": "#3b73b9", "label": "g"},
@@ -112,6 +116,24 @@ def densest_window(
 
     detail = sub[(sub["mjd"] >= best_lo) & (sub["mjd"] <= best_hi)].copy()
     return detail, best_lo, best_hi
+
+
+def busiest_night(df: pd.DataFrame, source: str) -> tuple[int, pd.DataFrame]:
+    """Return the integer-MJD night with the most epochs for one source."""
+    sub = df[df["name"] == source].copy()
+    if sub.empty:
+        raise ValueError(f"No rows found for source {source!r}")
+
+    if SINGLE_NIGHT_MJD is None:
+        counts = sub.groupby("night_mjd").size().sort_values(ascending=False)
+        night_mjd = int(counts.index[0])
+    else:
+        night_mjd = int(SINGLE_NIGHT_MJD)
+
+    night = sub[sub["night_mjd"] == night_mjd].sort_values("mjd").copy()
+    if night.empty:
+        raise ValueError(f"No rows found for {source!r} on integer MJD {night_mjd}")
+    return night_mjd, night
 
 
 def plot_cadence(df: pd.DataFrame) -> plt.Figure:
@@ -356,6 +378,124 @@ def plot_detail(df: pd.DataFrame, source: str = DETAIL_SOURCE) -> plt.Figure:
     return fig
 
 
+def plot_single_night(df: pd.DataFrame, source: str = SINGLE_NIGHT_SOURCE) -> plt.Figure:
+    night_mjd, night = busiest_night(df, source)
+    night = night.reset_index(drop=True)
+    filters_present = [f for f in FILTER_ORDER if f in set(night["filter"])]
+    night_date = mjd_to_datetime(pd.Series([float(night_mjd)])).iloc[0]
+
+    exptime_days = night["exptime"].fillna(0.0) / 86400.0
+    night["start"] = night["date"]
+    night["end"] = mjd_to_datetime(night["mjd"] + exptime_days)
+    night["exposure_number"] = np.arange(1, len(night) + 1)
+
+    gap_minutes = np.diff(night["mjd"].to_numpy()) * 24.0 * 60.0
+    median_gap = float(np.median(gap_minutes)) if len(gap_minutes) else 0.0
+    min_gap = float(np.min(gap_minutes)) if len(gap_minutes) else 0.0
+    max_gap = float(np.max(gap_minutes)) if len(gap_minutes) else 0.0
+
+    pad = pd.Timedelta(minutes=8)
+    first_time = night["start"].min() - pad
+    last_time = night["end"].max() + pad
+
+    fig = plt.figure(figsize=(13, 8.5), constrained_layout=True)
+    spec = fig.add_gridspec(2, 1, height_ratios=[1.4, 0.8])
+    exposure_ax = fig.add_subplot(spec[0, 0])
+    gap_ax = fig.add_subplot(spec[1, 0], sharex=exposure_ax)
+
+    for _, row in night.iterrows():
+        style = FILTER_STYLE[row["filter"]]
+        exposure_ax.hlines(
+            row["exposure_number"],
+            row["start"],
+            row["end"],
+            color=style["color"],
+            linewidth=3.4,
+            alpha=0.9,
+        )
+        exposure_ax.plot(
+            row["start"],
+            row["exposure_number"],
+            marker="|",
+            color=style["color"],
+            markersize=8,
+            markeredgewidth=1.4,
+        )
+
+    exposure_ax.set_title("Each exposure as a time interval", fontsize=11, fontweight="bold")
+    exposure_ax.set_ylabel("Exposure sequence", fontsize=10)
+    exposure_ax.set_ylim(0.3, len(night) + 0.7)
+    exposure_ax.set_xlim(first_time, last_time)
+    exposure_ax.grid(axis="x", color="#d2d2d2", linestyle=":", linewidth=0.55)
+    exposure_ax.grid(axis="y", color="#eeeeee", linestyle="-", linewidth=0.4)
+    exposure_ax.tick_params(axis="x", labelbottom=False)
+    exposure_ax.tick_params(axis="y", labelsize=8)
+    for spine in ("top", "right"):
+        exposure_ax.spines[spine].set_visible(False)
+
+    if len(gap_minutes):
+        gap_times = night["start"].iloc[1:]
+        gap_colors = [FILTER_STYLE[f]["color"] for f in night["filter"].iloc[1:]]
+        gap_ax.bar(
+            gap_times,
+            gap_minutes,
+            width=0.006,
+            color=gap_colors,
+            edgecolor="white",
+            linewidth=0.45,
+            alpha=0.9,
+        )
+    gap_ax.set_title("Gap since previous exposure", fontsize=11, fontweight="bold")
+    gap_ax.set_ylabel("Gap [min]", fontsize=10)
+    gap_ax.set_xlabel("UTC time during observing night", fontsize=10)
+    gap_ax.grid(axis="y", color="#eeeeee", linestyle="-", linewidth=0.5)
+    gap_ax.grid(axis="x", color="#d2d2d2", linestyle=":", linewidth=0.55)
+    gap_ax.xaxis.set_major_locator(mdates.MinuteLocator(interval=20))
+    gap_ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    gap_ax.xaxis.set_minor_locator(mdates.MinuteLocator(interval=10))
+    gap_ax.tick_params(axis="x", labelrotation=0, labelsize=9)
+    gap_ax.tick_params(axis="y", labelsize=9)
+    for spine in ("top", "right"):
+        gap_ax.spines[spine].set_visible(False)
+
+    handles = [
+        plt.Line2D([0], [0], color=FILTER_STYLE[f]["color"], linewidth=4, label=FILTER_STYLE[f]["label"])
+        for f in filters_present
+    ]
+    exposure_ax.legend(
+        handles=handles,
+        loc="upper left",
+        bbox_to_anchor=(1.005, 1.0),
+        frameon=False,
+        fontsize=9,
+        title="Filter",
+        title_fontsize=9,
+    )
+
+    filter_counts = night["filter"].value_counts().reindex(filters_present, fill_value=0)
+    filter_summary = ", ".join(
+        f"{FILTER_STYLE[f]['label']}={int(filter_counts[f])}" for f in filters_present
+    )
+    fig.suptitle(
+        f"{source}: busiest single observing night ({night_date:%Y-%m-%d}, integer MJD {night_mjd})",
+        fontsize=15,
+        fontweight="bold",
+    )
+    fig.text(
+        0.5,
+        0.972,
+        (
+            f"{len(night)} exposure epochs; filters: {filter_summary}; "
+            f"gap median/min/max = {median_gap:.1f}/{min_gap:.1f}/{max_gap:.1f} min"
+        ),
+        ha="center",
+        va="top",
+        fontsize=10,
+        color="#444444",
+    )
+    return fig
+
+
 def main() -> None:
     df = load_epochs()
     fig = plot_cadence(df)
@@ -366,10 +506,16 @@ def main() -> None:
     detail_fig.savefig(OUT_ZOOM_PDF, bbox_inches="tight")
     detail_fig.savefig(OUT_ZOOM_PNG, bbox_inches="tight", dpi=220)
     plt.close(detail_fig)
+    night_fig = plot_single_night(df)
+    night_fig.savefig(OUT_NIGHT_PDF, bbox_inches="tight")
+    night_fig.savefig(OUT_NIGHT_PNG, bbox_inches="tight", dpi=220)
+    plt.close(night_fig)
     print(f"Saved -> {OUT_PDF}")
     print(f"Saved -> {OUT_PNG}")
     print(f"Saved -> {OUT_ZOOM_PDF}")
     print(f"Saved -> {OUT_ZOOM_PNG}")
+    print(f"Saved -> {OUT_NIGHT_PDF}")
+    print(f"Saved -> {OUT_NIGHT_PNG}")
 
 
 if __name__ == "__main__":
