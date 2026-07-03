@@ -10,3 +10,5 @@ env/
 
 # Downloaded/generated FITS cache can grow quickly.
 hsc_fits_cache/
+hsc_cutout_cache/
+hsc_*_warp_cutout*.tar
