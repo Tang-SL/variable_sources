@@ -51,6 +51,16 @@ FILTER_TO_DAS = {
     "N1010": "NB1010",
 }
 
+DEFAULT_BAD_MASK_PLANES = (
+    "BAD",
+    "SAT",
+    "INTRP",
+    "CR",
+    "EDGE",
+    "NO_DATA",
+    "UNMASKEDNAN",
+)
+
 
 def get_session(use_existing_helper: bool = False) -> requests.Session:
     if use_existing_helper:
@@ -165,6 +175,18 @@ def count_to_njy_scale(fluxmag0: float) -> float:
     return 10 ** (0.4 * (AB_NJY_ZEROPOINT - zeropoint))
 
 
+def mask_plane_bits(mask_header: fits.Header, bad_mask_planes: tuple[str, ...]) -> tuple[int, str]:
+    bits = 0
+    found = []
+    for plane in bad_mask_planes:
+        key = f"MP_{plane}"
+        if key not in mask_header:
+            continue
+        bits |= 1 << int(mask_header[key])
+        found.append(plane)
+    return bits, ",".join(found)
+
+
 def measure_warp(
     fits_bytes: bytes,
     visit: int,
@@ -173,14 +195,17 @@ def measure_warp(
     aperture_radius_arcsec: float,
     annulus_inner_arcsec: float,
     annulus_outer_arcsec: float,
+    bad_mask_planes: tuple[str, ...],
 ) -> dict:
     with fits.open(BytesIO(fits_bytes)) as hdul:
         image = np.asarray(hdul[1].data, dtype=float)
         mask = np.asarray(hdul[2].data, dtype=np.int64)
         variance = np.asarray(hdul[3].data, dtype=float)
         header = hdul[1].header
+        mask_header = hdul[2].header
         primary = hdul[0].header
         fluxmag0 = float(primary["FLUXMAG0"])
+        bad_mask_bits, bad_mask_names = mask_plane_bits(mask_header, bad_mask_planes)
 
         wcs = WCS(header)
         x_arr, y_arr = wcs.world_to_pixel_values([ra], [dec])
@@ -194,12 +219,44 @@ def measure_warp(
         annulus = (radii >= annulus_inner_arcsec) & (radii <= annulus_outer_arcsec)
 
         finite = np.isfinite(image) & np.isfinite(variance)
-        unmasked = mask == 0
+        unmasked = (mask & bad_mask_bits) == 0
         ap_valid = aperture & finite & unmasked
         ann_valid = annulus & finite & unmasked
 
         if ap_valid.sum() == 0 or ann_valid.sum() < 10:
-            raise RuntimeError(f"Visit {visit} has too few usable aperture/annulus pixels")
+            return {
+                "visit": visit,
+                "measurement_status": "no_usable_pixels",
+                "warp_x": x,
+                "warp_y": y,
+                "pixel_scale_arcsec": scale,
+                "aperture_radius_arcsec": aperture_radius_arcsec,
+                "annulus_inner_arcsec": annulus_inner_arcsec,
+                "annulus_outer_arcsec": annulus_outer_arcsec,
+                "aperture_pixels": int(aperture.sum()),
+                "finite_aperture_pixels": int((aperture & finite).sum()),
+                "valid_aperture_pixels": int(ap_valid.sum()),
+                "annulus_pixels": int(annulus.sum()),
+                "finite_annulus_pixels": int((annulus & finite).sum()),
+                "valid_annulus_pixels": int(ann_valid.sum()),
+                "masked_aperture_pixels": int((aperture & ~unmasked).sum()),
+                "masked_annulus_pixels": int((annulus & ~unmasked).sum()),
+                "nonzero_mask_aperture_pixels": int((aperture & (mask != 0)).sum()),
+                "nonzero_mask_annulus_pixels": int((annulus & (mask != 0)).sum()),
+                "bad_mask_bits": bad_mask_bits,
+                "bad_mask_planes": bad_mask_names,
+                "sky_median_counts_per_pixel": math.nan,
+                "sky_sigma_counts_per_pixel": math.nan,
+                "aperture_flux_counts": math.nan,
+                "aperture_flux_err_counts": math.nan,
+                "variance_only_flux_err_counts": math.nan,
+                "aperture_flux_njy": math.nan,
+                "aperture_flux_err_njy": math.nan,
+                "snr": math.nan,
+                "aperture_mag_ab": math.nan,
+                "aperture_magerr_ab": math.nan,
+                "fluxmag0": fluxmag0,
+            }
 
         sky_values = image[ann_valid]
         sky_median = float(np.nanmedian(sky_values))
@@ -219,6 +276,7 @@ def measure_warp(
 
         return {
             "visit": visit,
+            "measurement_status": "ok",
             "warp_x": x,
             "warp_y": y,
             "pixel_scale_arcsec": scale,
@@ -226,11 +284,17 @@ def measure_warp(
             "annulus_inner_arcsec": annulus_inner_arcsec,
             "annulus_outer_arcsec": annulus_outer_arcsec,
             "aperture_pixels": int(aperture.sum()),
+            "finite_aperture_pixels": int((aperture & finite).sum()),
             "valid_aperture_pixels": int(ap_valid.sum()),
             "annulus_pixels": int(annulus.sum()),
+            "finite_annulus_pixels": int((annulus & finite).sum()),
             "valid_annulus_pixels": int(ann_valid.sum()),
-            "masked_aperture_pixels": int((aperture & finite & ~unmasked).sum()),
-            "masked_annulus_pixels": int((annulus & finite & ~unmasked).sum()),
+            "masked_aperture_pixels": int((aperture & ~unmasked).sum()),
+            "masked_annulus_pixels": int((annulus & ~unmasked).sum()),
+            "nonzero_mask_aperture_pixels": int((aperture & (mask != 0)).sum()),
+            "nonzero_mask_annulus_pixels": int((annulus & (mask != 0)).sum()),
+            "bad_mask_bits": bad_mask_bits,
+            "bad_mask_planes": bad_mask_names,
             "sky_median_counts_per_pixel": sky_median,
             "sky_sigma_counts_per_pixel": sky_std,
             "aperture_flux_counts": flux_counts,
@@ -263,7 +327,8 @@ def build_plot(df: pd.DataFrame, output_png: Path, output_pdf: Path) -> None:
     import matplotlib.pyplot as plt
 
     plot_df = df.sort_values("mjd").copy()
-    good = plot_df["aperture_flux_err_njy"] > 0
+    good = np.isfinite(plot_df["aperture_flux_njy"]) & (plot_df["aperture_flux_err_njy"] > 0)
+    missing = ~good
     x = plot_df["hours_since_start"]
 
     plt.style.use("seaborn-v0_8-whitegrid")
@@ -280,16 +345,28 @@ def build_plot(df: pd.DataFrame, output_png: Path, output_pdf: Path) -> None:
         capsize=2.5,
         markersize=5.0,
     )
+    if missing.any():
+        ax.scatter(
+            x[missing],
+            np.zeros(int(missing.sum())),
+            marker="x",
+            s=34,
+            linewidths=1.3,
+            color="#b2182b",
+            label="no usable pixels",
+            zorder=4,
+        )
     for _, row in plot_df.iterrows():
+        y_value = row["aperture_flux_njy"] if np.isfinite(row["aperture_flux_njy"]) else 0.0
         ax.annotate(
             str(int(row["visit"])),
-            (row["hours_since_start"], row["aperture_flux_njy"]),
+            (row["hours_since_start"], y_value),
             xytext=(0, 8),
             textcoords="offset points",
             ha="center",
             va="bottom",
             fontsize=7,
-            color="0.25",
+            color="0.25" if np.isfinite(row["aperture_flux_njy"]) else "#b2182b",
             rotation=45,
         )
 
@@ -301,6 +378,8 @@ def build_plot(df: pd.DataFrame, output_png: Path, output_pdf: Path) -> None:
     ax.set_xlabel("Hours since first exposure")
     ax.set_ylabel("Aperture flux (nJy)")
     ax.grid(True, alpha=0.28)
+    if missing.any():
+        ax.legend(loc="lower right", frameon=True, fontsize=8)
 
     info = (
         f"r={plot_df['aperture_radius_arcsec'].iloc[0]:.1f} arcsec aperture, "
@@ -324,6 +403,12 @@ def build_plot(df: pd.DataFrame, output_png: Path, output_pdf: Path) -> None:
     plt.close(fig)
 
 
+def output_tag(source: str, filt: str, integer_mjd: int) -> str:
+    source_tag = source.replace("_", "")
+    filter_tag = filt.replace("/", "_")
+    return f"hsc_{source_tag}_{filter_tag}_mjd{integer_mjd}"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--epochs", type=Path, default=SCRIPT_DIR / "hsc_epochs.csv")
@@ -336,13 +421,24 @@ def main() -> None:
     parser.add_argument("--aperture-radius-arcsec", type=float, default=1.0)
     parser.add_argument("--annulus-inner-arcsec", type=float, default=2.0)
     parser.add_argument("--annulus-outer-arcsec", type=float, default=3.5)
+    parser.add_argument("--bad-mask-planes", nargs="+", default=list(DEFAULT_BAD_MASK_PLANES))
     parser.add_argument("--cache-dir", type=Path, default=SCRIPT_DIR / "hsc_cutout_cache")
-    parser.add_argument("--output", type=Path, default=SCRIPT_DIR / "hsc_cid1205_N1010_mjd58488_warp_aperture_photometry.csv")
-    parser.add_argument("--plot-png", type=Path, default=SCRIPT_DIR / "hsc_cid1205_N1010_mjd58488_warp_aperture_photometry.png")
-    parser.add_argument("--plot-pdf", type=Path, default=SCRIPT_DIR / "hsc_cid1205_N1010_mjd58488_warp_aperture_photometry.pdf")
-    parser.add_argument("--sequence-output", type=Path, default=SCRIPT_DIR / "hsc_epochs_cid1205_N1010_mjd58488.csv")
+    parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--plot-png", type=Path, default=None)
+    parser.add_argument("--plot-pdf", type=Path, default=None)
+    parser.add_argument("--sequence-output", type=Path, default=None)
     parser.add_argument("--use-existing-session-helper", action="store_true")
     args = parser.parse_args()
+
+    tag = output_tag(args.source, args.filter, args.integer_mjd)
+    if args.output is None:
+        args.output = SCRIPT_DIR / f"{tag}_warp_aperture_photometry.csv"
+    if args.plot_png is None:
+        args.plot_png = SCRIPT_DIR / f"{tag}_warp_aperture_photometry.png"
+    if args.plot_pdf is None:
+        args.plot_pdf = SCRIPT_DIR / f"{tag}_warp_aperture_photometry.pdf"
+    if args.sequence_output is None:
+        args.sequence_output = SCRIPT_DIR / f"hsc_epochs_{args.source.replace('_', '')}_{args.filter}_mjd{args.integer_mjd}.csv"
 
     sequence = load_sequence(args.epochs, args.source, args.filter, args.integer_mjd)
     sequence.to_csv(args.sequence_output, index=False)
@@ -379,6 +475,7 @@ def main() -> None:
             aperture_radius_arcsec=args.aperture_radius_arcsec,
             annulus_inner_arcsec=args.annulus_inner_arcsec,
             annulus_outer_arcsec=args.annulus_outer_arcsec,
+            bad_mask_planes=tuple(args.bad_mask_planes),
         )
         rows.append(row)
 
